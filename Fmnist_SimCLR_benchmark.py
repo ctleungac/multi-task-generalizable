@@ -223,6 +223,12 @@ def build_classifier(
 
 def run_experiment(args: argparse.Namespace):
     os.makedirs("results", exist_ok=True)
+    csv_path = os.path.join("results", "Fmnist_SimCLR_benchmark.csv")
+
+    # Ensure the results file starts fresh on each invocation to avoid mixing
+    # with prior runs.
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
 
     SAMPLE_NUM = args.sample_num
     lambda_list = args.lambda_list
@@ -243,6 +249,8 @@ def run_experiment(args: argparse.Namespace):
 
     for run_id in range(num_runs):
         print(f"\n=== Starting Run {run_id + 1}/{num_runs} ===")
+
+        run_results = []
 
         label_permutation = np.random.permutation(10)
         label_first_half = label_permutation[:5]
@@ -341,14 +349,20 @@ def run_experiment(args: argparse.Namespace):
                                 "downstream_accuracy": acc,
                             }
                         )
+                        run_results.append(results[-1])
 
                         print(
                             f"Overlap {overlap_id}, test SNR {snr_test}: accuracy={acc:.4f}"
                         )
 
+        df_run = pd.DataFrame(run_results)
+        write_header = not os.path.exists(csv_path)
+        df_run.to_csv(csv_path, mode="a", index=False, header=write_header)
+        print(f"Saved results for run {run_id + 1} to {csv_path}")
+
     df = pd.DataFrame(results)
-    df.to_csv("./results/Fmnist_SimCLR_benchmark.csv", index=False)
-    print("Saved results to ./results/Fmnist_SimCLR_benchmark.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved aggregated results to {csv_path}")
 
 
 # ---------------------------------------------------------------------------
