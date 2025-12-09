@@ -1,47 +1,102 @@
 #!/usr/bin/env python3
 
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers
-import tensorflow.keras.backend as K
-from tensorflow.keras.models import load_model
-import pandas as pd
 import argparse
-
+import datetime
 import os
+from typing import Tuple
 
-
-
-# For demonstration only (if you're using it): 
-# from matplotlib import pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import tensorflow.keras.backend as K
+from tensorflow.keras import layers
 
 
 # ----------------------------
 # 1) Define custom layers/classes/functions
 # ----------------------------
 
+
 class GaussianNoiseLayer(layers.Layer):
+    """Applies additive white Gaussian noise using the provided standard deviation."""
+
     def __init__(self, stddev, **kwargs):
         super(GaussianNoiseLayer, self).__init__(**kwargs)
         self.stddev = stddev
-    
+
     def call(self, inputs, training=None):
-        if training:
-            noise = tf.random.normal(shape=tf.shape(inputs), mean=0.0, stddev=self.stddev)
-            return inputs + noise
-        else:
-            noise = tf.random.normal(shape=tf.shape(inputs), mean=0.0, stddev=self.stddev)
-            return inputs + noise
-    
+        noise = tf.random.normal(shape=tf.shape(inputs), mean=0.0, stddev=self.stddev)
+        return inputs + noise
+
     def get_config(self):
         config = super(GaussianNoiseLayer, self).get_config()
         config.update({'noise_var': self.stddev})
         return config
 
+
+def augment_mnist(image: tf.Tensor) -> tf.Tensor:
+    """Performs a lightweight SimCLR-style augmentation for MNIST images."""
+
+    image = tf.reshape(image, [28, 28, 1])
+    # Random crop with padding similar to SimCLR's random resized crop
+    image = tf.image.resize_with_crop_or_pad(image, 32, 32)
+    image = tf.image.random_crop(image, size=[28, 28, 1])
+    # Random horizontal flip helps for MNIST even if digits might change orientation
+    image = tf.image.random_flip_left_right(image)
+    # Slight random brightness for contrastive learning
+    image = tf.image.random_brightness(image, max_delta=0.2)
+    image = tf.clip_by_value(image, 0.0, 1.0)
+    return tf.reshape(image, [28 * 28])
+
+
+def simclr_nt_xent_loss(proj_1: tf.Tensor, proj_2: tf.Tensor, temperature: float = 0.5) -> tf.Tensor:
+    """Computes the NT-Xent contrastive loss used by SimCLR."""
+
+    batch_size = tf.shape(proj_1)[0]
+    proj_1 = tf.math.l2_normalize(proj_1, axis=1)
+    proj_2 = tf.math.l2_normalize(proj_2, axis=1)
+
+    representations = tf.concat([proj_1, proj_2], axis=0)
+    similarity_matrix = tf.matmul(representations, representations, transpose_b=True)
+
+    # Remove similarity with itself
+    mask = tf.linalg.set_diag(tf.ones_like(similarity_matrix), tf.zeros_like(tf.linalg.diag_part(similarity_matrix)))
+    logits = similarity_matrix / temperature
+    logits = logits - 1e9 * (1.0 - mask)
+
+    labels = tf.concat([
+        tf.range(batch_size, batch_size * 2),
+        tf.range(batch_size)
+    ], axis=0)
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+    return tf.reduce_mean(loss)
+
+
+def build_base_encoder(input_shape: Tuple[int, ...]) -> tf.keras.Model:
+    """Builds the shared encoder used by both phases."""
+
+    input_layer = tf.keras.layers.Input(shape=input_shape)
+    x = tf.keras.layers.Dense(128, activation='relu')(input_layer)
+    x = tf.keras.layers.Dense(40, activation='relu')(x)
+    quantized = tf.keras.layers.Lambda(
+        lambda t: tf.quantization.fake_quant_with_min_max_vars(
+            t, min=tf.reduce_min(t), max=tf.reduce_max(t), num_bits=8
+        )
+    )(x)
+    return tf.keras.Model(inputs=input_layer, outputs=quantized, name="base_encoder")
+
+
+def build_projection_head(input_tensor: tf.Tensor) -> tf.Tensor:
+    """Creates a simple 2-layer projection head as used in SimCLR."""
+
+    proj = tf.keras.layers.Dense(80, activation='relu')(input_tensor)
+    proj = tf.keras.layers.Dense(64)(proj)
+    return proj
+
 def get_data_phase1(LABEL_FIRST_HALF):
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
-    x_train = x_train / 255.0
-    x_test = x_test / 255.0
+    x_train = (x_train / 255.0).astype('float32')
+    x_test = (x_test / 255.0).astype('float32')
     
     x_train = x_train.reshape(x_train.shape[0], -1)
     x_test = x_test.reshape(x_test.shape[0], -1)
@@ -98,9 +153,8 @@ def main():
                         default=list(np.arange(-5, 20, 3)),
                         help="List of testing SNR values (default=-5:3:20)")
     
-    parser.add_argument("--num_run", nargs="+", type=int,
-                        default=3,
-                        help="List of testing SNR ")
+    parser.add_argument("--num_run", type=int, default=3,
+                        help="Number of independent runs for the experiment")
     
     args = parser.parse_args()
     
@@ -121,15 +175,17 @@ def main():
     print("SNR_test_list=", SNR_test_list)
     
     # num_runs = 5  # Number of full re-trainings
-    embeddingDim = 80
     batchsize = 256
     datalist = []
+
+    os.makedirs("results", exist_ok=True)
 
     # ------------------------------------------------
     # The rest of your training script
     # ------------------------------------------------
     
     for run_id in range(num_runs):
+        run_datalist = []
         print(f"\n=== Starting Run {run_id+1}/{num_runs} ===")
 
         # label permutation
@@ -149,6 +205,7 @@ def main():
         for snr_train in SNR_train_list:
             print("current training snr:", snr_train)
             for lambda_val in lambda_list:
+                # The lambda parameter is kept for logging to mirror the benchmark settings
                 noise_sd = getnoisevariance(snr_train, 1)
                 print("current lambda:", lambda_val)
 
@@ -157,157 +214,146 @@ def main():
                 tf.keras.utils.set_random_seed(42)
 
                 # ----------------------------
-                # Build the model
+                # Phase 1: SimCLR pre-training
                 # ----------------------------
+                base_encoder = build_base_encoder((x_train.shape[1],))
 
-                # Encoder
-                # Define input layer
-                input_layer = tf.keras.layers.Input(shape=x_train[0].shape)
+                simclr_input = tf.keras.layers.Input(shape=x_train[0].shape)
+                encoded = base_encoder(simclr_input)
+                normalized_embed = tf.keras.layers.Lambda(lambda t: tf.math.tanh(t))(encoded)
+                noisy_embed = GaussianNoiseLayer(stddev=noise_sd)(normalized_embed)
+                projection = build_projection_head(noisy_embed)
+                simclr_model = tf.keras.Model(inputs=simclr_input, outputs=projection, name="simclr_model")
 
-                # Build the encoder
-                encoder_1 = tf.keras.layers.Dense(128, activation='relu')(input_layer)
-                encoder_2 = tf.keras.layers.Dense(40, activation='relu')(encoder_1)
-                #encoder_2 = tf.keras.layers.Dense(40, activation='relu')(encoder_2)
+                optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4)
+                AUTOTUNE = tf.data.AUTOTUNE
 
-                # Quantize encoder_2's output to 8-bit precision
-        #         encoder_2_quantized = tf.keras.layers.Lambda(
-        #             lambda x: tf.quantization.fake_quant_with_min_max_vars(x, min=0.0, max=6.0, num_bits=8)
-        #         )(encoder_2)
-                encoder_2_quantized = tf.keras.layers.Lambda(
-                    lambda x: tf.quantization.fake_quant_with_min_max_vars(x,min=tf.reduce_min(x),max=tf.reduce_max(x),num_bits=8)
-                )(encoder_2)
+                def _make_dataset(data: np.ndarray) -> tf.data.Dataset:
+                    ds = tf.data.Dataset.from_tensor_slices(data.astype(np.float32))
+                    ds = ds.shuffle(min(10000, data.shape[0]), seed=run_id)
+                    ds = ds.map(lambda sample: (augment_mnist(sample), augment_mnist(sample)),
+                                num_parallel_calls=AUTOTUNE)
+                    ds = ds.batch(batchsize)
+                    ds = ds.prefetch(AUTOTUNE)
+                    return ds
 
-                # Define and save the embedding network (encoder only)
-                embedding_network = tf.keras.Model(inputs=input_layer, outputs=encoder_2_quantized)
+                x_phase1 = x_train[:min(SAMPLE_NUM, x_train.shape[0])]
+                simclr_dataset = _make_dataset(x_phase1)
 
-                # Continue with the rest of the network (Phase 1 full model)
-                normalized_x = tf.keras.layers.Lambda(lambda x: tf.math.tanh(x))(encoder_2_quantized)
-                noise_sd = getnoisevariance(snr_train, 1)
-                noise_layer = GaussianNoiseLayer(stddev=noise_sd)(normalized_x)
+                simclr_epochs = 150
+                simclr_losses = []
 
-                # Classification branch
-                CE_decoder_1 = tf.keras.layers.Dense(40, activation='relu')(noise_layer)
-                CE_decoder_1 = tf.keras.layers.Dense(40, activation='relu')(CE_decoder_1)
-                CE_output = tf.keras.layers.Dense(10, activation='softmax', name='CE')(CE_decoder_1)
+                for epoch in range(simclr_epochs):
+                    epoch_losses = []
+                    for aug_1, aug_2 in simclr_dataset:
+                        with tf.GradientTape() as tape:
+                            proj_1 = simclr_model(aug_1, training=True)
+                            proj_2 = simclr_model(aug_2, training=True)
+                            loss = simclr_nt_xent_loss(proj_1, proj_2)
+                        gradients = tape.gradient(loss, simclr_model.trainable_variables)
+                        optimizer.apply_gradients(zip(gradients, simclr_model.trainable_variables))
+                        epoch_losses.append(float(loss))
+                    mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+                    simclr_losses.append(mean_loss)
+                    if epoch % 10 == 0:
+                        print(f"SimCLR epoch {epoch+1}/{simclr_epochs} - loss: {mean_loss:.4f}")
 
-                # Reconstruction branch
-                mse_decoder_1 = tf.keras.layers.Dense(256, activation='relu')(noise_layer)
-                mse_output = tf.keras.layers.Dense(x_train.shape[1], activation='sigmoid', name='mse')(mse_decoder_1)
+                pretrain_loss = simclr_losses[-1] if simclr_losses else 0.0
+                print(f"Finished SimCLR pre-training with final loss {pretrain_loss:.4f}")
 
-                # Construct the full model
-                full_model = tf.keras.Model(inputs=input_layer, outputs=[CE_output, mse_output])
-                lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-                    initial_learning_rate=0.05, decay_steps=10000, decay_rate=0.8)
-                opt = tf.keras.optimizers.SGD(learning_rate=lr_schedule)
-                full_model.compile(optimizer=opt,
-                                   loss={'CE': 'categorical_crossentropy', 'mse': 'mse'},
-                                   metrics={'CE': 'accuracy', 'mse': tf.keras.metrics.RootMeanSquaredError()},
-                                   loss_weights=[1, lambda_val])
-
-                # Train first phase
-                history = full_model.fit(
-                    x=x_train, 
-                    y=(Y_train, x_train),
-                    batch_size=batchsize,
-                    epochs=150,     # shortened to 2 for demonstration
-                    verbose=0,
-                    validation_data=(x_test, (Y_test, x_test))
-                )
-
-                first_acc = history.history['val_CE_accuracy'][-1]
-                print("current acc:", first_acc)
-                print("training phase 2")
-
-                # Save the embedding network
-                embedding_network.save("embedding_network2.h5")
+                base_encoder.save("embedding_network2.h5")
 
                 # ----------------------------
-                # Second training loop
+                # Phase 2: Downstream classification (benchmark decoder)
                 # ----------------------------
                 overlap_count = 0
                 for i in range(label2_list.shape[0]):
                     print("current overlap:", i)
                     x_train_2, x_test_2, Y_train_2, Y_test_2 = get_data_phase1(label2_list[5 - i])
 
+                    x_train_2 = x_train_2[:min(SAMPLE_NUM, x_train_2.shape[0])]
+                    Y_train_2 = Y_train_2[:x_train_2.shape[0]]
+
                     for snr_test in SNR_test_list:
                         print("test snr:", snr_test)
                         noise_sd_test = getnoisevariance(snr_test, 1)
 
-                        # Load embedding network
+                        input_layer = tf.keras.layers.Input(shape=x_train[0].shape)
                         embedding_network_2 = tf.keras.models.load_model("embedding_network2.h5", compile=False)
-                        for layer in embedding_network_2.layers:
-                            layer.trainable = False
+                        embedding_network_2.trainable = False
 
-                        # Rebuild new classifier head for second training
-                        # We must re-use the 'normalized_x' from the original pipeline
                         embedded_output = embedding_network_2(input_layer)
-                        normalized_embedded = tf.keras.layers.Lambda(lambda x: tf.math.tanh(x))(embedded_output)
+                        normalized_embedded = tf.keras.layers.Lambda(lambda t: tf.math.tanh(t))(embedded_output)
                         noise_layer_1 = GaussianNoiseLayer(stddev=noise_sd_test)(normalized_embedded)
 
-                        # Build the decoder (classification branch for phase 2)
                         CE_dense_2 = tf.keras.layers.Dense(40, activation='relu')(noise_layer_1)
                         CE_dense_3 = tf.keras.layers.Dense(40, activation='relu')(CE_dense_2)
                         CE_output2 = tf.keras.layers.Dense(10, activation='softmax', name='CE2')(CE_dense_3)
-                        reconstructed_model = tf.keras.models.Model(inputs = input_layer, outputs = [CE_output2,mse_output])
 
-                        # Second-phase compile
+                        classifier_model = tf.keras.models.Model(inputs=input_layer, outputs=CE_output2)
+
                         lr_schedule_2 = tf.keras.optimizers.schedules.ExponentialDecay(
-                    initial_learning_rate=3e-2, decay_steps=10000, decay_rate=0.8)
+                            initial_learning_rate=3e-2, decay_steps=10000, decay_rate=0.8)
                         opt_2 = tf.keras.optimizers.SGD(learning_rate=lr_schedule_2)
 
-                        reconstructed_model.compile(
+                        classifier_model.compile(
                             optimizer=opt_2,
-                            loss={'CE2': 'categorical_crossentropy', 'mse': 'mse'},
-                            loss_weights=[1, 0],  # so the 'mse' branch won't affect training
-                            metrics={'CE2': 'accuracy', 'mse': 'mean_squared_error'}
+                            loss='categorical_crossentropy',
+                            metrics=['accuracy']
                         )
 
-                        # Fit second phase
-                        history1 = reconstructed_model.fit(
+                        history1 = classifier_model.fit(
                             x=x_train_2,
-                            y=(Y_train_2, x_train_2),
+                            y=Y_train_2,
                             batch_size=batchsize,
-                            epochs=100,  # shortened for demonstration
+                            epochs=100,
                             verbose=0,
-                            validation_data=(x_test_2, (Y_test_2, x_test_2))
+                            validation_data=(x_test_2, Y_test_2)
                         )
 
-                        # Evaluate
-                        results = reconstructed_model.evaluate(x=x_test_2, y=(Y_test_2, x_test_2), verbose=0)
-                        # 'results' structure is [loss_total, CE2_loss, mse_loss, CE2_accuracy, mse_mse]
-                        second_accuracy = results[3]
-                        second_mse = results[4]
+                        final_val_accuracy = history1.history['val_accuracy'][-1]
+
+                        results = classifier_model.evaluate(x=x_test_2, y=Y_test_2, verbose=0)
+                        second_accuracy = results[1]
 
                         savedata = {
+                            "run": run_id + 1,
                             "lambda": lambda_val,
-                            "first lr": 0.05,
-                            "first batchsize": 256,
-                            "first accuracy": first_acc,
+                            "simclr_final_loss": pretrain_loss,
                             "train snr": snr_train,
                             "test snr": snr_test,
-                            "second loss (mse)": second_mse,
                             "second accuracy": second_accuracy,
+                            "val_accuracy_history": history1.history['val_accuracy'],
                             "overlap": overlap_count
                         }
 
                         datalist.append(savedata)
-                                                                                
+                        run_datalist.append(savedata)
+
                         overlap_count += 1
 
-                        print("final acc:", second_accuracy)
+                        print(f"final acc: {second_accuracy:.4f} (val acc final {final_val_accuracy:.4f})")
+
+        if run_datalist:
+            df_run = pd.DataFrame(run_datalist)
+            run_timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+            run_filename = f"./results/RLA_mnist_simclr_benchmark_run{run_id+1}_{run_timestamp}.csv"
+            df_run.to_csv(run_filename, index=False)
+            print(f"Run {run_id+1} complete. Results saved to '{run_filename}'.")
+        else:
+            print(f"Run {run_id+1} complete but no results were generated.")
 
     # ----------------------------
     # 3) Convert results to DataFrame and save to Excel or CSV
     # ----------------------------
-    df = pd.DataFrame(datalist)
-    # df.to_excel("RLA_cifar_quanti.xlsx", index=False)
-    # If you prefer CSV:
-    timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
-    filename = f"./results/RLA_mnist_quanti_snr_{timestamp}.csv"
-    df.to_csv(filename, index=False)
-    #df.to_csv("./results/RLA_mnist_quanti_snr.csv", index=False)
-
-    print("Training complete. Results saved to 'RLA_mnist_quanti_snr.xlsx'.")
+    if datalist:
+        df = pd.DataFrame(datalist)
+        timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+        filename = f"./results/RLA_mnist_simclr_benchmark_{timestamp}.csv"
+        df.to_csv(filename, index=False)
+        print(f"Training complete. Results saved to '{filename}'.")
+    else:
+        print("Training complete but no results were generated.")
 
 
 if __name__ == "__main__":
