@@ -185,6 +185,7 @@ def main():
     # ------------------------------------------------
     
     for run_id in range(num_runs):
+        run_datalist = []
         print(f"\n=== Starting Run {run_id+1}/{num_runs} ===")
 
         # label permutation
@@ -316,6 +317,7 @@ def main():
                         second_accuracy = results[1]
 
                         savedata = {
+                            "run": run_id + 1,
                             "lambda": lambda_val,
                             "simclr_final_loss": pretrain_loss,
                             "train snr": snr_train,
@@ -326,10 +328,20 @@ def main():
                         }
 
                         datalist.append(savedata)
+                        run_datalist.append(savedata)
 
                         overlap_count += 1
 
                         print(f"final acc: {second_accuracy:.4f} (val acc final {final_val_accuracy:.4f})")
+
+        if run_datalist:
+            df_run = pd.DataFrame(run_datalist)
+            run_timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+            run_filename = f"./results/RLA_mnist_simclr_benchmark_run{run_id+1}_{run_timestamp}.csv"
+            df_run.to_csv(run_filename, index=False)
+            print(f"Run {run_id+1} complete. Results saved to '{run_filename}'.")
+        else:
+            print(f"Run {run_id+1} complete but no results were generated.")
 
     # ----------------------------
     # 3) Convert results to DataFrame and save to Excel or CSV
